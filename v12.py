@@ -185,7 +185,7 @@ def identify_patterns(df):
                     price_level = price_b2
 
     # --- B. DOUBLE TOP (M) ---
-    if len(top_indices) >= 2:
+    if not pat_name and len(top_indices) >= 2:
         t1_idx = top_indices[-2]
         t2_idx = top_indices[-1]
         
@@ -306,7 +306,7 @@ def process_stock_data(df):
     try:
         ichi = ta.ichimoku(df['High'], df['Low'], df['Close'])[0]
         df = pd.concat([df, ichi], axis=1)
-    except: pass
+    except Exception: pass
 
     # Detect Pattern
     pattern_data = identify_patterns(df)
@@ -446,13 +446,24 @@ def get_data(tickers):
     bulk = yf.download(tickers, period="1y", interval="1h", group_by='ticker', progress=False, threads=True)
     processed = {}
     summ = []
-    
+    failed = []
+
     for t in tickers:
         try:
             df = bulk[t].copy()
             if df.empty or len(df) < 100: continue
             df.dropna(inplace=True)
-            
+
+            # Drop the current, still-forming candle (its High/Low/Close are
+            # mid-bar and will keep changing until the hour closes), otherwise
+            # signals/patterns are computed on incomplete data and repaint.
+            if not df.empty:
+                last_ts = df.index[-1]
+                now = pd.Timestamp.now(tz=last_ts.tzinfo)
+                if last_ts + pd.Timedelta(hours=1) > now:
+                    df = df.iloc[:-1]
+            if df.empty or len(df) < 100: continue
+
             df, wr, tr, score, interp_list, chart_text, pattern = process_stock_data(df)
             processed[t] = {'df': df, 'wr': wr, 'tr': tr, 'interp_list': interp_list, 'chart_text': chart_text, 'pattern': pattern}
             
@@ -473,22 +484,29 @@ def get_data(tickers):
                 "SCORE": f"{score}/12", # Updated Score
                 "RSI": f"{int(last['RSI'])}"
             })
-        except: pass
-        
-    return processed, pd.DataFrame(summ)
+        except Exception:
+            failed.append(t)
+
+    return processed, pd.DataFrame(summ), failed
 
 # --- MAIN APP ---
 st.title("📈 US Stocks Analyzer")
 
 if 'chart_range' not in st.session_state: st.session_state['chart_range'] = '1M'
 
-data, df_summ = get_data(TICKERS)
+data, df_summ, failed_tickers = get_data(TICKERS)
 
 # --- SCANNER ---
 st.subheader("📡 Market Scanner")
-valid_wr = [int(x.split('%')[0]) for x in df_summ['WIN RATE'] if '0%' not in x]
+# Average over stocks with at least one closed backtest trade. (Previously this
+# filtered on the substring "0%" in the display string, which also excluded
+# every stock whose win rate ended in 0 - e.g. 10%, 20%, ... 100% - skewing
+# the average.)
+valid_wr = [d['wr'] for d in data.values() if d['tr'] > 0]
 avg_wr = sum(valid_wr)/len(valid_wr) if valid_wr else 0
 st.info(f"📊 **System Avg Win Rate:** {int(avg_wr)}%")
+if failed_tickers:
+    st.warning(f"⚠️ {len(failed_tickers)} ticker(s) failed to load and are excluded from the scanner: {', '.join(failed_tickers)}")
 
 def style_table(df):
     def highlight_live(val):
