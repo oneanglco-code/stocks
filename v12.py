@@ -552,14 +552,14 @@ st.caption(f"Exits are volatility-scaled: target +{target_mult}×ATR, stop −{s
 if failed_tickers:
     st.warning(f"⚠️ {len(failed_tickers)} ticker(s) failed to load and are excluded from the scanner: {', '.join(failed_tickers)}")
 
-def style_table(df):
+def style_table(df, highlight_cols=('LIVE', 'DECISION')):
     def highlight_live(val):
         if 'LONG' in str(val) or 'BUY' in str(val): return 'background-color: #00FF00; color: black; font-weight: bold'
         if 'SHORT' in str(val) or 'SELL' in str(val): return 'background-color: #FF4444; color: white; font-weight: bold'
         return ''
-    
+
     # Use Pandas Styler to Force Colors
-    styler = df.style.map(highlight_live, subset=['LIVE', 'DECISION'])
+    styler = df.style.map(highlight_live, subset=list(highlight_cols))
     if is_dark:
         styler.set_properties(**{'background-color': '#262730', 'color': 'white', 'border-color': '#444444'})
     else:
@@ -567,6 +567,56 @@ def style_table(df):
     return styler
 
 st.dataframe(style_table(df_summ), use_container_width=True)
+
+# --- SUGGESTED STOCKS FOR TODAY ---
+st.subheader("🎯 Suggested Stocks for Today")
+MIN_TRADES = 5
+suggestions = []
+for t, d in data.items():
+    # Quality bar: proven edge only - win rate above breakeven, positive
+    # expectancy, and enough closed trades that the number means something
+    if d['tr'] < MIN_TRADES or d['wr'] <= breakeven or d['edge'] <= 0:
+        continue
+    last_row = d['df'].iloc[-1]
+    score = len(d['interp_list']['Positive'])
+    live_long = bool(last_row['Buy_Signal'])
+    live_short = bool(last_row['Sell_Signal'])
+    uptrend = last_row['UT_Trend'] == 1 and last_row['Close'] > last_row['EMA_200']
+
+    reasons = []
+    if live_long:
+        action = "💎 LONG NOW"; reasons.append("live buy signal")
+    elif live_short:
+        action = "🩸 SHORT NOW"; reasons.append("live sell signal")
+    elif uptrend and score >= 8:
+        action = "👀 WATCH LONG"; reasons.append(f"strong uptrend ({score}/12 bullish)")
+    else:
+        continue
+
+    pat = d['pattern']
+    if pat and pat['sentiment'] == ('Neg' if live_short else 'Pos'):
+        reasons.append(pat['name'])
+
+    suggestions.append(((live_long or live_short, d['edge'], score), {
+        "TICKER": t,
+        "PRICE": f"{last_row['Close']:.2f}",
+        "ACTION": action,
+        "WIN RATE": f"{int(d['wr'])}% ({d['tr']})",
+        "EDGE": f"{d['edge']:+.2f} ATR",
+        "SCORE": f"{score}/12",
+        "WHY": ", ".join(reasons),
+    }))
+
+suggestions.sort(key=lambda x: x[0], reverse=True)
+df_sugg = pd.DataFrame([row for _, row in suggestions[:10]])
+if df_sugg.empty:
+    st.caption("No setups meet the quality bar right now (win rate above breakeven, positive edge, "
+               f"≥{MIN_TRADES} closed trades, plus a live signal or strong uptrend). Sitting out is a position too.")
+else:
+    st.dataframe(style_table(df_sugg, ('ACTION',)), use_container_width=True)
+    st.caption(f"Quality bar: win rate above breakeven ({breakeven:.0f}%), positive edge, ≥{MIN_TRADES} closed trades. "
+               "Live signals rank above watchlist setups, then by edge. Top 10 shown.")
+
 st.divider()
 
 # --- DEEP DIVE ---
