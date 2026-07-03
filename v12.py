@@ -121,6 +121,13 @@ with st.sidebar.expander("🎨 Chart Colors", expanded=False):
 st.sidebar.subheader("🖼️ Overlays")
 show_patterns = st.sidebar.toggle("🧩 Show Patterns", value=True)
 
+# --- STRATEGY EXITS ---
+st.sidebar.subheader("🎯 Trade Exits (× ATR)")
+target_mult = st.sidebar.slider("Profit Target", 0.5, 3.0, 0.75, 0.25,
+    help="Take profit at entry + this many ATRs. Smaller target = hit more often = higher win rate, but less profit per win.")
+stop_mult = st.sidebar.slider("Stop Loss", 1.0, 5.0, 4.0, 0.5,
+    help="Stop out at entry - this many ATRs. Wider stop = fewer stop-outs = higher win rate, but bigger loss when wrong.")
+
 # --- 0. CONFIGURATION ---
 TICKERS = [
     'AAPL', 'TSLA', 'NVDA', 'AVGO', 'AZN', 'CSCO', 'WBA', 'ASML', 'ADBE', 'GILD', 
@@ -234,28 +241,33 @@ def identify_patterns(df):
     return None
 
 # --- 2. STRATEGY & CALCULATIONS ---
-def calculate_expert_strategy(df, sensitivity=2, atr_period=1):
+def calculate_expert_strategy(df, sensitivity=2, atr_period=10):
+    # ATR(10) instead of ATR(1): a 1-bar "ATR" is just the last candle's true
+    # range, so the trailing stop whipsawed on every noisy hour.
     df['ATR_UT'] = ta.atr(df['High'], df['Low'], df['Close'], length=atr_period)
     df['src'] = (df['Open'] + df['High'] + df['Low'] + df['Close']) / 4
     df['nLoss'] = sensitivity * df['ATR_UT']
-    
+
     src = df['src'].values; nLoss = df['nLoss'].values
     trailing_stop = np.zeros(len(df))
-    
-    for i in range(atr_period, len(df)):
+
+    for i in range(1, len(df)):
         prev_stop = trailing_stop[i-1]
         curr_src = src[i]; prev_src = src[i-1]
         loss = nLoss[i]
-        
+        if np.isnan(loss):
+            trailing_stop[i] = prev_stop
+            continue
+
         if (curr_src > prev_stop) and (prev_src > prev_stop):
             trailing_stop[i] = max(prev_stop, curr_src - loss)
         elif (curr_src < prev_stop) and (prev_src < prev_stop):
             trailing_stop[i] = min(prev_stop, curr_src + loss)
         elif (curr_src > prev_stop):
             trailing_stop[i] = curr_src - loss
-        else: 
+        else:
             trailing_stop[i] = curr_src + loss
-            
+
     df['Trailing_Stop'] = trailing_stop
     df['UT_Trend'] = np.where(df['src'] > df['Trailing_Stop'], 1, -1)
 
@@ -267,25 +279,68 @@ def calculate_expert_strategy(df, sensitivity=2, atr_period=1):
         df['Stoch_K'] = 50; df['Stoch_D'] = 50
 
     df['EMA_200'] = ta.ema(df['Close'], length=200)
+    df['EMA_50'] = ta.ema(df['Close'], length=50)
 
+    # Regime filter (EMA50 on the right side of EMA200): only buy dips in an
+    # established uptrend and short rallies in an established downtrend, not
+    # on the first whipsaw poke through EMA200.
     df['Buy_Signal'] = (
         (df['UT_Trend'] == 1) & (df['Close'] > df['EMA_200']) &
-        (df['Stoch_K'].shift(1) < 20) & (df['Stoch_K'] > df['Stoch_D']) & 
+        (df['EMA_50'] > df['EMA_200']) &
+        (df['Stoch_K'].shift(1) < 20) & (df['Stoch_K'] > df['Stoch_D']) &
         (df['Stoch_K'] > df['Stoch_K'].shift(1))
     )
     df['Sell_Signal'] = (
         (df['UT_Trend'] == -1) & (df['Close'] < df['EMA_200']) &
+        (df['EMA_50'] < df['EMA_200']) &
         (df['Stoch_K'].shift(1) > 80) & (df['Stoch_K'] < df['Stoch_D']) &
         (df['Stoch_K'] < df['Stoch_K'].shift(1))
     )
     return df
 
+# --- 2b. BACKTEST ENGINE ---
+def backtest_signals(df, target_mult, stop_mult, max_hold=300):
+    """Walk each historical signal forward with ATR-scaled exits.
+
+    Exits are in units of ATR(14) at entry, so targets/stops adapt to each
+    stock's volatility instead of a fixed percent that means nothing on both
+    MELI and KO. When a bar touches both target and stop, it counts as a LOSS,
+    so the reported win rate is a conservative floor, not an optimistic guess.
+    """
+    highs = df['High'].values; lows = df['Low'].values; closes = df['Close'].values
+    atr = df['ATR'].values
+    n = len(df)
+    wins, losses = 0, 0
+
+    def walk(i, is_long):
+        nonlocal wins, losses
+        if np.isnan(atr[i]) or atr[i] <= 0: return
+        entry = closes[i]
+        if is_long:
+            tgt = entry + target_mult * atr[i]; stp = entry - stop_mult * atr[i]
+        else:
+            tgt = entry - target_mult * atr[i]; stp = entry + stop_mult * atr[i]
+        for j in range(i + 1, min(n, i + 1 + max_hold)):
+            hit_stop = (lows[j] <= stp) if is_long else (highs[j] >= stp)
+            if hit_stop: losses += 1; return
+            hit_tgt = (highs[j] >= tgt) if is_long else (lows[j] <= tgt)
+            if hit_tgt: wins += 1; return
+
+    for i in np.flatnonzero(df['Buy_Signal'].values[:-1]): walk(i, True)
+    for i in np.flatnonzero(df['Sell_Signal'].values[:-1]): walk(i, False)
+
+    trades = wins + losses
+    wr = wins / trades * 100 if trades else 0
+    # Expectancy per trade in ATR units: positive = the system makes money
+    # even after losses; win rate alone can't tell you that.
+    edge = (wins * target_mult - losses * stop_mult) / trades if trades else 0
+    return wr, trades, edge
+
 # --- 3. INDICATOR PROCESSING ---
-def process_stock_data(df):
+def process_stock_data(df, target_mult=0.75, stop_mult=4.0):
     df = calculate_expert_strategy(df)
-    
+
     # Indicators
-    df['EMA_50'] = ta.ema(df['Close'], length=50)
     df['SMA_20'] = ta.sma(df['Close'], length=20)
     df['SMA_50'] = ta.sma(df['Close'], length=50)
     df['EMA_20'] = ta.ema(df['Close'], length=20)
@@ -406,44 +461,28 @@ def process_stock_data(df):
         else: 
             msg = "ADL Falling"; interp_list['Negative'].append(msg); chart_text['ADL'] = f"🔴 {msg}"
 
-    # Win Rate
+    # Backtest with ATR-scaled exits (same parameters for every ticker)
     pos_count = len(interp_list['Positive'])
-    wins, losses, trades = 0, 0, 0
-    entries = df.index[df['Buy_Signal']]
-    shorts = df.index[df['Sell_Signal']]
-    target, stop = 0.010, 0.020
-    
-    for t in entries:
-        if t == df.index[-1]: continue
-        p = df.loc[t]['Close']
-        future = df.loc[t:].iloc[1:]
-        for _, r in future.iterrows():
-            if r['High'] >= p*(1+target): wins+=1; trades+=1; break
-            if r['Low'] <= p*(1-stop): losses+=1; trades+=1; break
-            
-    for t in shorts:
-        if t == df.index[-1]: continue
-        p = df.loc[t]['Close']
-        future = df.loc[t:].iloc[1:]
-        for _, r in future.iterrows():
-            if r['Low'] <= p*(1-target): wins+=1; trades+=1; break
-            if r['High'] >= p*(1+stop): losses+=1; trades+=1; break
-            
-    wr = (wins/trades*100) if trades > 0 else 0
-    return df, wr, trades, pos_count, interp_list, chart_text, pattern_data
+    wr, trades, edge = backtest_signals(df, target_mult, stop_mult)
+    return df, wr, trades, edge, pos_count, interp_list, chart_text, pattern_data
 
 # --- 4. DECISION ---
 def get_decision(df):
     last = df.iloc[-1]
     if last['Buy_Signal']: return "💎 BUY DIP", "green"
     elif last['Sell_Signal']: return "🩸 SELL RALLY", "red"
-    elif last['UT_Trend'] == 1: return "✅ UPTREND", "lightgreen"
+    elif last['UT_Trend'] == 1 and last['Close'] > last['EMA_200']: return "✅ UPTREND", "lightgreen"
+    elif last['UT_Trend'] == 1: return "🔄 RECOVERING", "yellow"
     return "⚠️ DOWNTREND", "gray"
 
 # --- 5. DATA PIPELINE ---
+@st.cache_data(ttl=3600, show_spinner="Downloading Market Data...")
+def download_bulk(tickers):
+    return yf.download(tickers, period="1y", interval="1h", group_by='ticker', progress=False, threads=True)
+
 @st.cache_data(ttl=3600, show_spinner="Analyzing Market...")
-def get_data(tickers):
-    bulk = yf.download(tickers, period="1y", interval="1h", group_by='ticker', progress=False, threads=True)
+def get_data(tickers, target_mult, stop_mult):
+    bulk = download_bulk(tickers)
     processed = {}
     summ = []
     failed = []
@@ -464,8 +503,8 @@ def get_data(tickers):
                     df = df.iloc[:-1]
             if df.empty or len(df) < 100: continue
 
-            df, wr, tr, score, interp_list, chart_text, pattern = process_stock_data(df)
-            processed[t] = {'df': df, 'wr': wr, 'tr': tr, 'interp_list': interp_list, 'chart_text': chart_text, 'pattern': pattern}
+            df, wr, tr, edge, score, interp_list, chart_text, pattern = process_stock_data(df, target_mult, stop_mult)
+            processed[t] = {'df': df, 'wr': wr, 'tr': tr, 'edge': edge, 'interp_list': interp_list, 'chart_text': chart_text, 'pattern': pattern}
             
             last = df.iloc[-1]
             dec, col = get_decision(df)
@@ -480,8 +519,9 @@ def get_data(tickers):
                 "PATTERN": pat_str,
                 "LIVE": live,
                 "WIN RATE": f"{int(wr)}% ({tr})",
+                "EDGE": f"{edge:+.2f} ATR",
                 "DECISION": dec,
-                "SCORE": f"{score}/12", # Updated Score
+                "SCORE": f"{score}/12",
                 "RSI": f"{int(last['RSI'])}"
             })
         except Exception:
@@ -494,17 +534,21 @@ st.title("📈 US Stocks Analyzer")
 
 if 'chart_range' not in st.session_state: st.session_state['chart_range'] = '1M'
 
-data, df_summ, failed_tickers = get_data(TICKERS)
+data, df_summ, failed_tickers = get_data(TICKERS, target_mult, stop_mult)
 
 # --- SCANNER ---
 st.subheader("📡 Market Scanner")
-# Average over stocks with at least one closed backtest trade. (Previously this
-# filtered on the substring "0%" in the display string, which also excluded
-# every stock whose win rate ended in 0 - e.g. 10%, 20%, ... 100% - skewing
-# the average.)
-valid_wr = [d['wr'] for d in data.values() if d['tr'] > 0]
-avg_wr = sum(valid_wr)/len(valid_wr) if valid_wr else 0
-st.info(f"📊 **System Avg Win Rate:** {int(avg_wr)}%")
+# Average over stocks with at least one closed backtest trade
+traded = [d for d in data.values() if d['tr'] > 0]
+avg_wr = sum(d['wr'] for d in traded)/len(traded) if traded else 0
+avg_edge = sum(d['edge'] for d in traded)/len(traded) if traded else 0
+# Breakeven win rate for the chosen exit geometry: below this, a "high"
+# win rate still loses money
+breakeven = stop_mult / (stop_mult + target_mult) * 100
+st.info(f"📊 **System Avg Win Rate:** {int(avg_wr)}%  |  **Breakeven:** {breakeven:.0f}%  |  **Avg Edge:** {avg_edge:+.2f} ATR/trade")
+st.caption(f"Exits are volatility-scaled: target +{target_mult}×ATR, stop −{stop_mult}×ATR, same settings for every stock. "
+           "When a candle touches both target and stop, it counts as a loss, so these win rates are a conservative floor. "
+           "A win rate above breakeven means positive expectancy (Avg Edge > 0).")
 if failed_tickers:
     st.warning(f"⚠️ {len(failed_tickers)} ticker(s) failed to load and are excluded from the scanner: {', '.join(failed_tickers)}")
 
@@ -539,12 +583,13 @@ if selected:
     if last['Buy_Signal']: st.success(f"🚨 LIVE BUY SIGNAL: {selected}")
     elif last['Sell_Signal']: st.error(f"🚨 LIVE SELL SIGNAL: {selected}")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Price", f"${last['Close']:.2f}")
     c2.metric("Win Rate", f"{int(d['wr'])}%", f"{d['tr']} Trades")
-    c3.metric("Pos Indicators", f"{len(interp_list['Positive'])}")
+    c3.metric("Edge/Trade", f"{d['edge']:+.2f} ATR")
+    c4.metric("Pos Indicators", f"{len(interp_list['Positive'])}")
     dec, _ = get_decision(df)
-    c4.metric("Strategy", dec)
+    c5.metric("Strategy", dec)
 
     # --- 1. TRADINGVIEW CHART ---
     st.markdown("### 🖼️ TradingView Chart")
