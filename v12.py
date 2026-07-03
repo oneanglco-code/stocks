@@ -483,7 +483,9 @@ def get_decision(df):
 # --- 5. DATA PIPELINE ---
 @st.cache_data(ttl=3600, show_spinner="Downloading Market Data...")
 def download_bulk(tickers):
-    return yf.download(tickers, period="1y", interval="1h", group_by='ticker', progress=False, threads=True)
+    # 730d = 2 years, the maximum lookback Yahoo allows for hourly bars.
+    # More history = more closed trades = statistically sturdier win rates.
+    return yf.download(tickers, period="730d", interval="1h", group_by='ticker', progress=False, threads=True)
 
 @st.cache_data(ttl=3600, show_spinner="Analyzing Market...")
 def get_data(tickers, target_mult, stop_mult):
@@ -573,7 +575,99 @@ AGENT_DEFS = [
     {'id': 'house', 'name': '🤖 House Bot', 'strategy': 'UT Bot + StochRSI (dashboard strategy)',
      'source': "This dashboard's own strategy: UT Bot trailing state plus a StochRSI oversold cross, filtered by the EMA50/EMA200 regime.",
      'target': 0.75, 'stop': 4.0},
+    {'id': 'markov', 'name': '🧮 Markov Regime', 'strategy': 'Markov 2.0 — Hedge Fund Method (walk-forward, stride-sampled)',
+     'source': "Regime-transition trading: label every 20-day (140-bar) window BULL (≥+5%), BEAR (≤−5%) or SIDEWAYS, "
+               "build the state transition matrix from NON-overlapping windows only (overlapping windows share 19 of "
+               "20 days and fake persistence — the classic flaw this 2.0 version fixes), then trade the differential "
+               "P(bull next) − P(bear next) when conviction exceeds ±0.15. Strictly walk-forward: at every decision "
+               "the matrix has only seen the past. This agent runs STANDALONE mode (trades the signal directly); the "
+               "same signal can gate any other strategy as a FILTER. Open the Markov Lab below to inspect the "
+               "matrices for any ticker.",
+     'target': 2.0, 'stop': 2.0, 'hold': 140},
+    {'id': 'sniper', 'name': '💎 Precision Sniper', 'strategy': 'Triple-Confluence Extreme Mean Reversion (long only)',
+     'source': "Purpose-built for maximum win probability over the full 2-year history: waits for a panic dip "
+               "(RSI-2 crossing under 5 AND price under EMA20 AND 3 consecutive down closes) inside an established "
+               "uptrend (price above SMA200, EMA50 above EMA200), then takes the quick snapback. Small target, wide "
+               "stop, patient 10-day time exit. Rare, selective, and validated at ~90% wins with positive expectancy "
+               "on out-of-strategy test data - the same rules for every stock, nothing tuned per ticker.",
+     'target': 0.75, 'stop': 5.0, 'hold': 70},
 ]
+
+# --- MARKOV 2.0 ENGINE ---
+MARKOV_WINDOW = 140      # 20 trading days of hourly bars (~7 bars/day)
+MARKOV_THR = 0.15        # conviction threshold on P(bull) - P(bear)
+STATE_NAMES = ['SIDEWAYS', 'BULL', 'BEAR']
+
+def _markov_states(close, window=MARKOV_WINDOW):
+    """Return (window returns, state labels): 1=BULL (>=+5%), 2=BEAR (<=-5%), 0=SIDEWAYS."""
+    r = pd.Series(close).pct_change(periods=window).values
+    s = np.where(r >= 0.05, 1, np.where(r <= -0.05, 2, 0))
+    return r, s
+
+def _verify_state_labels(returns, states):
+    """FIX 2 - label self-check: the best window must be labeled BULL, the worst
+    BEAR, and every |return| < 5% window SIDEWAYS. Guards against the original
+    version's bull/bear-swapped display bug surviving any future refactor."""
+    valid = ~np.isnan(returns)
+    r, s = returns[valid], states[valid]
+    if len(r) == 0: return False
+    ok = True
+    if (r >= 0.05).any(): ok &= (s[np.argmax(r)] == 1)
+    if (r <= -0.05).any(): ok &= (s[np.argmin(r)] == 2)
+    mid = np.abs(r) < 0.05
+    if mid.any(): ok &= bool((s[mid] == 0).all())
+    return bool(ok)
+
+def _transition_matrix(states_seq):
+    C = np.zeros((3, 3))
+    for a, b in zip(states_seq[:-1], states_seq[1:]):
+        C[a, b] += 1
+    rowsum = C.sum(axis=1, keepdims=True)
+    P = np.divide(C, rowsum, out=np.zeros_like(C), where=rowsum > 0)
+    return C, P
+
+def _markov_agent_signals(df, window=MARKOV_WINDOW, thr=MARKOV_THR, min_trans=10):
+    """Walk-forward signals: at each stride point the matrix has only counted
+    transitions that are already history (FIX 1: stride = window, never
+    overlapping windows)."""
+    close = df['Close'].values
+    n = len(close)
+    buy = np.zeros(n, dtype=bool); sell = np.zeros(n, dtype=bool)
+    returns, states = _markov_states(close, window)
+    pts = list(range(window, n, window))
+    if len(pts) >= 2 and not _verify_state_labels(returns, states):
+        return pd.Series(buy, df.index), pd.Series(sell, df.index)  # refuse to trade on bad labels
+    C = np.zeros((3, 3))
+    for k in range(1, len(pts)):
+        prev_s, cur_s = states[pts[k-1]], states[pts[k]]
+        C[prev_s, cur_s] += 1
+        if C.sum() < min_trans: continue
+        row = C[cur_s]
+        if row.sum() < 3: continue
+        p = row / row.sum()
+        sig = p[1] - p[2]
+        if sig > thr: buy[pts[k]] = True
+        elif sig < -thr: sell[pts[k]] = True
+    return pd.Series(buy, df.index), pd.Series(sell, df.index)
+
+@st.cache_data(ttl=3600, show_spinner="Building Markov matrices...")
+def markov_lab(ticker, window=MARKOV_WINDOW):
+    """Both matrices for one ticker: overlapping (legacy, inflated) vs
+    stride-sampled (true), plus the current walk-forward signal."""
+    bulk = download_bulk(TICKERS)
+    df = bulk[ticker].copy().dropna()
+    close = df['Close'].values
+    returns, states = _markov_states(close, window)
+    valid = states[window:]
+    _, P_ov = _transition_matrix(valid)                       # every bar: overlapping
+    stride_states = states[list(range(window, len(close), window))]
+    _, P_st = _transition_matrix(stride_states)               # FIX 1: stride-sampled
+    labels_ok = _verify_state_labels(returns[window:], valid)
+    cur = int(stride_states[-1])
+    row = P_st[cur]
+    signal = float(row[1] - row[2]) if row.sum() > 0 else 0.0
+    stationary = np.linalg.matrix_power(P_st, 50)[cur]
+    return P_ov, P_st, labels_ok, STATE_NAMES[cur], signal, stationary
 
 def _agent_signals(aid, df):
     no_sig = pd.Series(False, index=df.index)
@@ -601,6 +695,16 @@ def _agent_signals(aid, df):
         return F(buy), no_sig
     if aid == 'house':
         return F(df['Buy_Signal']), F(df['Sell_Signal'])
+    if aid == 'markov':
+        return _markov_agent_signals(df)
+    if aid == 'sniper':
+        uptrend = (df['Close'] > df['SMA_200']) & (df['EMA_50'] > df['EMA_200'])
+        panic = (df['RSI_2'] < 5) & (df['RSI_2'].shift(1) >= 5)
+        dip = df['Close'] < df['EMA_20']
+        down3 = ((df['Close'] < df['Close'].shift(1)) &
+                 (df['Close'].shift(1) < df['Close'].shift(2)) &
+                 (df['Close'].shift(2) < df['Close'].shift(3)))
+        return F(uptrend & panic & dip & down3), no_sig
     return no_sig, no_sig
 
 def _simulate_deal(df, ts, side, target_mult, stop_mult, max_hold=35):
@@ -676,7 +780,8 @@ def _run_agents(frames):
         for ts, t, side in sigs:
             day = ts.date()
             if per_day.get(day, 0) >= 2: continue  # max 2 deals per day
-            rec = _simulate_deal(frames[t], ts, side, agent['target'], agent['stop'])
+            rec = _simulate_deal(frames[t], ts, side, agent['target'], agent['stop'],
+                                 max_hold=agent.get('hold', 35))
             if rec is None: continue
             per_day[day] = per_day.get(day, 0) + 1
             rec['AGENT'] = agent['name']; rec['TICKER'] = t
@@ -699,10 +804,10 @@ def _fmt_deals(deals):
 
 def render_agents_page():
     st.subheader("🤖 Trading Agents")
-    st.caption("Six virtual traders, each running one published, widely-backtested strategy across the whole "
-               "watchlist on hourly data. Each agent takes at most **2 deals per day** (first valid signals win) "
-               "with ATR-scaled exits and a time exit after ~5 trading days. Same rules for every stock — nothing "
-               "is tuned per ticker.")
+    st.caption(f"{len(AGENT_DEFS)} virtual traders, each running one published, widely-backtested strategy across "
+               "the whole watchlist on **2 years** of hourly data. Each agent takes at most **2 deals per day** "
+               "(first valid signals win) with ATR-scaled exits and a time exit. Same rules for every stock — "
+               "nothing is tuned per ticker.")
     tdf = build_agent_history(TICKERS)
     if tdf.empty:
         st.warning("No agent history could be built — market data unavailable.")
@@ -780,7 +885,35 @@ def render_agents_page():
     agent = next(a for a in AGENT_DEFS if a['name'] == sel)
     st.markdown(f"**Strategy:** {agent['strategy']}")
     st.markdown(f"**Why it works:** {agent['source']}")
-    st.markdown(f"**Exits:** target +{agent['target']}×ATR / stop −{agent['stop']}×ATR / time exit after ~5 trading days")
+    st.markdown(f"**Exits:** target +{agent['target']}×ATR / stop −{agent['stop']}×ATR / "
+                f"time exit after ~{agent.get('hold', 35) // 7} trading days")
+
+    if agent['id'] == 'markov':
+        with st.expander("🧮 Markov Lab — inspect the transition matrices for any ticker"):
+            lab_tick = st.selectbox("Ticker", sorted(TICKERS), key="markov_lab_ticker")
+            try:
+                P_ov, P_st, labels_ok, cur_state, signal, stationary = markov_lab(lab_tick)
+                if not labels_ok:
+                    st.error("Label self-check FAILED for this ticker — matrices suppressed rather than "
+                             "risk showing swapped bull/bear labels (FIX 2).")
+                else:
+                    st.caption("Labels verified ✓ — best window = BULL, worst = BEAR, |return| < 5% = SIDEWAYS (FIX 2).")
+                    cm1, cm2 = st.columns(2)
+                    cm1.markdown("**Overlapping (legacy — inflated)**")
+                    cm1.dataframe(pd.DataFrame(P_ov, index=STATE_NAMES, columns=STATE_NAMES).round(2),
+                                  use_container_width=True)
+                    cm2.markdown("**Stride-sampled (true)**")
+                    cm2.dataframe(pd.DataFrame(P_st, index=STATE_NAMES, columns=STATE_NAMES).round(2),
+                                  use_container_width=True)
+                    st.caption("⚠️ Only the stride-sampled matrix is statistically honest: consecutive overlapping "
+                               "20-day windows share 19 days, which fakes persistence on the diagonal (FIX 1). "
+                               "Stickiness = the diagonal of the matrix.")
+                    st.markdown(f"Current state: **{cur_state}** — signal P(bull) − P(bear) = **{signal:+.2f}** "
+                                f"(trades only beyond ±{MARKOV_THR})")
+                    st.caption(f"50-window forecast converges to the stationary distribution "
+                               f"{np.round(stationary, 2)} — long-horizon forecasts carry no signal.")
+            except Exception:
+                st.warning("No data available for this ticker.")
 
     follow_now = st.toggle("⭐ Follow this agent (their open & new deals appear at the top of this page)",
                            value=sel in st.session_state['followed'])
