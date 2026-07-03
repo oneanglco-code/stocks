@@ -7,6 +7,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
 from scipy.signal import argrelextrema
+import json, os, smtplib, ssl
+from email.mime.text import MIMEText
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="US Stocks Analyzer", layout="wide", page_icon="📈")
@@ -795,6 +797,65 @@ def _run_agents(frames):
 def build_agent_history(tickers):
     return _run_agents(_prepare_agent_frames(download_bulk(tickers), tickers))
 
+# --- EMAIL ALERTS ---
+# Subscriptions persist in a JSON file next to the app. SMTP credentials come
+# from Streamlit secrets ([smtp] section) so nothing sensitive lives in code.
+SUBS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subscriptions.json")
+
+def _load_subs():
+    try:
+        with open(SUBS_FILE) as f: return json.load(f)
+    except Exception: return {"subs": []}
+
+def _save_subs(data):
+    try:
+        with open(SUBS_FILE, "w") as f: json.dump(data, f, indent=2, default=str)
+    except Exception: pass
+
+def _smtp_config():
+    try:
+        s = st.secrets["smtp"]
+        return {'server': s['server'], 'port': int(s.get('port', 465)),
+                'user': s['user'], 'password': s['password'],
+                'sender': s.get('sender', s['user'])}
+    except Exception:
+        return None
+
+def _send_email(cfg, to, subject, body):
+    msg = MIMEText(body)
+    msg['Subject'] = subject; msg['From'] = cfg['sender']; msg['To'] = to
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP_SSL(cfg['server'], cfg['port'], context=ctx) as srv:
+        srv.login(cfg['user'], cfg['password'])
+        srv.sendmail(cfg['sender'], [to], msg.as_string())
+
+def notify_subscribers(tdf):
+    """Email each subscriber the deals their agent entered since the last
+    notification. Runs on every Agents page load, so alerts go out whenever
+    the hourly data refresh reveals new entries."""
+    data = _load_subs()
+    if not data.get('subs'): return
+    cfg = _smtp_config()
+    if cfg is None: return
+    changed = False
+    for sub in data['subs']:
+        try:
+            a = tdf[tdf['AGENT'] == sub['agent']]
+            if a.empty: continue
+            new = a[a['ENTRY TIME'] > pd.Timestamp(sub['last_notified'])]
+            if new.empty: continue
+            lines = [f"• {r['SIDE']} {r['TICKER']} @ {r['ENTRY']}  ({r['ENTRY TIME']})"
+                     for _, r in new.sort_values('ENTRY TIME').iterrows()]
+            _send_email(cfg, sub['email'],
+                        f"🔔 {sub['agent']} entered {len(new)} new deal(s)",
+                        f"{sub['agent']} — new deals:\n\n" + "\n".join(lines) +
+                        "\n\nOpen the dashboard for exits and live status.\n— US Stocks Analyzer")
+            sub['last_notified'] = str(new['ENTRY TIME'].max())
+            changed = True
+        except Exception:
+            continue  # one bad subscription must not block the others
+    if changed: _save_subs(data)
+
 def _fmt_deals(deals):
     out = deals.copy()
     out['ENTRY TIME'] = out['ENTRY TIME'].dt.strftime('%Y-%m-%d %H:%M')
@@ -812,6 +873,8 @@ def render_agents_page():
     if tdf.empty:
         st.warning("No agent history could be built — market data unavailable.")
         return
+
+    notify_subscribers(tdf)
 
     if 'followed' not in st.session_state: st.session_state['followed'] = set()
 
@@ -856,6 +919,7 @@ def render_agents_page():
                      'WIN RATE': f"{wr:.0f}%",
                      'TOTAL P&L': f"{closed['PNL %'].sum():+.1f}%",
                      'AVG/DEAL': f"{closed['PNL %'].mean():+.2f}%" if len(closed) else "—",
+                     'TOP LOSS': f"{closed['PNL %'].min():+.2f}%" if len(closed) else "—",
                      'PROFIT FACTOR': "∞" if pf == float('inf') else f"{pf:.2f}",
                      'FOLLOWING': '⭐' if agent['name'] in st.session_state['followed'] else ''})
     rows.sort(key=lambda r: r['_pnl'], reverse=True)
@@ -923,18 +987,53 @@ def render_agents_page():
     a = view[view['AGENT'] == sel]
     closed = a[a['OUTCOME'] != 'OPEN']
     wins = closed[closed['PNL %'] > 0]
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Deals", len(a))
     m2.metric("Win Rate", f"{(len(wins) / len(closed) * 100):.0f}%" if len(closed) else "—")
     m3.metric("Total P&L", f"{closed['PNL %'].sum():+.1f}%")
     m4.metric("Avg R", f"{closed['R'].mean():+.2f}" if len(closed) else "—")
-    m5.metric("Open Deals", len(a) - len(closed))
+    m5.metric("Top Loss", f"{closed['PNL %'].min():+.2f}%" if len(closed) else "—")
+    m6.metric("Open Deals", len(a) - len(closed))
 
     if a.empty:
         st.caption("No deals for this agent in the selected period.")
     else:
         st.dataframe(style_table(_fmt_deals(a.sort_values('ENTRY TIME', ascending=False)), ('SIDE',)),
                      use_container_width=True)
+
+    # --- EMAIL ALERTS FOR THIS AGENT ---
+    st.markdown("##### 🔔 Email Alerts")
+    subs_data = _load_subs()
+    my_subs = [s for s in subs_data['subs'] if s['agent'] == sel]
+    email_in = st.text_input("Get an email whenever this agent enters a stock",
+                             placeholder="you@example.com", key=f"email_{agent['id']}")
+    col_sub, col_unsub = st.columns(2)
+    if col_sub.button("🔔 Subscribe", key=f"sub_{agent['id']}"):
+        if email_in and "@" in email_in and "." in email_in.split("@")[-1]:
+            already = any(s['email'].lower() == email_in.lower() for s in my_subs)
+            if already:
+                st.info(f"{email_in} is already subscribed to {sel}.")
+            else:
+                # baseline = latest existing entry, so only FUTURE deals trigger mail
+                agent_deals = tdf[tdf['AGENT'] == sel]
+                baseline = agent_deals['ENTRY TIME'].max() if not agent_deals.empty else tdf['ENTRY TIME'].max()
+                subs_data['subs'].append({'email': email_in, 'agent': sel, 'last_notified': str(baseline)})
+                _save_subs(subs_data)
+                st.success(f"Subscribed! {email_in} will be emailed when {sel} enters a new deal.")
+        else:
+            st.error("Please enter a valid email address.")
+    if my_subs:
+        st.caption("Subscribed: " + ", ".join(s['email'] for s in my_subs))
+        if col_unsub.button("🗑️ Unsubscribe all from this agent", key=f"unsub_{agent['id']}"):
+            subs_data['subs'] = [s for s in subs_data['subs'] if s['agent'] != sel]
+            _save_subs(subs_data)
+            st.rerun()
+    if _smtp_config() is None:
+        st.warning("Email sending isn't configured yet. Add an `[smtp]` section (server, port, user, password, "
+                   "sender) to your Streamlit secrets — see `.streamlit/secrets.toml.example`. Subscriptions are "
+                   "saved now and start working the moment SMTP is configured.")
+    else:
+        st.caption("Alerts are checked on every data refresh (hourly cache) whenever the app is open or visited.")
 
 # --- MAIN APP ---
 st.title("📈 US Stocks Analyzer")
