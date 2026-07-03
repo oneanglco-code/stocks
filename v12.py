@@ -18,6 +18,11 @@ if 'is_dark' not in st.session_state:
 def toggle_theme():
     st.session_state['is_dark'] = not st.session_state['is_dark']
 
+# --- NAVIGATION ---
+st.sidebar.title("📍 Sections")
+page = st.sidebar.radio("Go to", ["📡 Market Scanner", "🤖 Trading Agents"], label_visibility="collapsed")
+st.sidebar.divider()
+
 # Sidebar Toggle
 st.sidebar.header("⚙️ Settings")
 is_dark = st.sidebar.toggle("🌙 Dark Mode", value=st.session_state['is_dark'], on_change=toggle_theme)
@@ -529,10 +534,284 @@ def get_data(tickers, target_mult, stop_mult):
 
     return processed, pd.DataFrame(summ), failed
 
+# --- TABLE STYLING (shared by both sections) ---
+def style_table(df, highlight_cols=('LIVE', 'DECISION')):
+    def highlight_live(val):
+        if 'LONG' in str(val) or 'BUY' in str(val): return 'background-color: #00FF00; color: black; font-weight: bold'
+        if 'SHORT' in str(val) or 'SELL' in str(val): return 'background-color: #FF4444; color: white; font-weight: bold'
+        return ''
+
+    # Use Pandas Styler to Force Colors
+    styler = df.style.map(highlight_live, subset=list(highlight_cols)) if highlight_cols else df.style
+    if is_dark:
+        styler.set_properties(**{'background-color': '#262730', 'color': 'white', 'border-color': '#444444'})
+    else:
+        styler.set_properties(**{'background-color': '#FFFFFF', 'color': 'black', 'border-color': '#E6E6EA'})
+    return styler
+
+# --- 6. TRADING AGENTS ---
+# Each agent runs ONE published, widely-backtested strategy across the whole
+# watchlist and takes at most 2 deals per day (first valid signals win).
+# Exits are ATR-scaled per strategy + a time exit after ~5 trading days so
+# every deal resolves and the history is complete.
+AGENT_DEFS = [
+    {'id': 'rsi2', 'name': '🎯 Dip Sniper', 'strategy': 'RSI-2 Mean Reversion (long only)',
+     'source': "Larry Connors' RSI-2 system: buy extreme 2-period oversold in stocks trading above their 200-bar average. One of the most consistently backtested mean-reversion edges in equities (75%+ documented win rates).",
+     'target': 1.0, 'stop': 3.0},
+    {'id': 'trend', 'name': '🏄 Trend Surfer', 'strategy': 'EMA Pullback Trend-Following',
+     'source': "Classic trend continuation: when EMA50 > EMA200 and ADX confirms a real trend, buy the pullback as price reclaims EMA20. Mirrored for shorts in downtrends.",
+     'target': 2.0, 'stop': 2.0},
+    {'id': 'turtle', 'name': '🐢 Turtle Breakout', 'strategy': 'Donchian 55-bar Channel Breakout',
+     'source': "Richard Dennis' Turtle system: buy fresh 55-bar highs in the direction of the major trend, sell fresh 55-bar lows. Low win rate by design, but winners are 2x the risk.",
+     'target': 3.0, 'stop': 1.5},
+    {'id': 'macd', 'name': '⚡ Momentum Rider', 'strategy': 'MACD Zero-Line Momentum',
+     'source': "Gerald Appel's MACD: enter when momentum crosses back up below the zero line inside a larger uptrend (a reset, not a chase). Mirrored for shorts.",
+     'target': 2.0, 'stop': 2.0},
+    {'id': 'bband', 'name': '🎈 Band Snapper', 'strategy': 'Bollinger Band Snapback (long only)',
+     'source': "John Bollinger's bands: fade a close below the lower band while the stock holds above EMA200, targeting the snap back toward the mean.",
+     'target': 1.0, 'stop': 3.0},
+    {'id': 'house', 'name': '🤖 House Bot', 'strategy': 'UT Bot + StochRSI (dashboard strategy)',
+     'source': "This dashboard's own strategy: UT Bot trailing state plus a StochRSI oversold cross, filtered by the EMA50/EMA200 regime.",
+     'target': 0.75, 'stop': 4.0},
+]
+
+def _agent_signals(aid, df):
+    no_sig = pd.Series(False, index=df.index)
+    F = lambda s: s.fillna(False).astype(bool)
+    if aid == 'rsi2':
+        buy = (df['Close'] > df['SMA_200']) & (df['RSI_2'] < 10) & (df['RSI_2'].shift(1) >= 10)
+        return F(buy), no_sig
+    if aid == 'trend':
+        up = (df['EMA_50'] > df['EMA_200']) & (df['ADX_14'] > 20)
+        dn = (df['EMA_50'] < df['EMA_200']) & (df['ADX_14'] > 20)
+        buy = up & (df['Close'] > df['EMA_20']) & (df['Close'].shift(1) <= df['EMA_20'].shift(1))
+        sell = dn & (df['Close'] < df['EMA_20']) & (df['Close'].shift(1) >= df['EMA_20'].shift(1))
+        return F(buy), F(sell)
+    if aid == 'turtle':
+        buy = (df['Close'] > df['DC_HI']) & (df['Close'].shift(1) <= df['DC_HI'].shift(1)) & (df['EMA_50'] > df['EMA_200'])
+        sell = (df['Close'] < df['DC_LO']) & (df['Close'].shift(1) >= df['DC_LO'].shift(1)) & (df['EMA_50'] < df['EMA_200'])
+        return F(buy), F(sell)
+    if aid == 'macd':
+        m, s = df['MACD_12_26_9'], df['MACDs_12_26_9']
+        buy = (m > s) & (m.shift(1) <= s.shift(1)) & (m < 0) & (df['Close'] > df['EMA_200'])
+        sell = (m < s) & (m.shift(1) >= s.shift(1)) & (m > 0) & (df['Close'] < df['EMA_200'])
+        return F(buy), F(sell)
+    if aid == 'bband':
+        buy = (df['Close'] < df['BB_LOW']) & (df['Close'].shift(1) >= df['BB_LOW'].shift(1)) & (df['Close'] > df['EMA_200'])
+        return F(buy), no_sig
+    if aid == 'house':
+        return F(df['Buy_Signal']), F(df['Sell_Signal'])
+    return no_sig, no_sig
+
+def _simulate_deal(df, ts, side, target_mult, stop_mult, max_hold=35):
+    i = df.index.get_loc(ts)
+    atr = df['ATR'].iloc[i]
+    if pd.isna(atr) or atr <= 0 or i >= len(df) - 1: return None
+    entry = df['Close'].iloc[i]
+    tgt = entry + side * target_mult * atr
+    stp = entry - side * stop_mult * atr
+    exit_price = exit_ts = outcome = None
+    end = min(len(df), i + 1 + max_hold)
+    for j in range(i + 1, end):
+        hi, lo = df['High'].iloc[j], df['Low'].iloc[j]
+        # stop checked first: same-bar ambiguity counts against the agent
+        if (lo <= stp) if side == 1 else (hi >= stp):
+            exit_price, exit_ts, outcome = stp, df.index[j], 'LOSS'; break
+        if (hi >= tgt) if side == 1 else (lo <= tgt):
+            exit_price, exit_ts, outcome = tgt, df.index[j], 'WIN'; break
+    if outcome is None:
+        if end == len(df) and (len(df) - 1 - i) < max_hold:
+            exit_price, exit_ts, outcome = df['Close'].iloc[-1], pd.NaT, 'OPEN'
+        else:
+            j = end - 1
+            exit_price, exit_ts = df['Close'].iloc[j], df.index[j]
+            outcome = 'TIME-WIN' if side * (exit_price - entry) > 0 else 'TIME-LOSS'
+    pnl = side * (exit_price - entry) / entry * 100
+    r = side * (exit_price - entry) / (stop_mult * atr)
+    return {'SIDE': 'LONG' if side == 1 else 'SHORT', 'ENTRY TIME': df.index[i],
+            'ENTRY': round(entry, 2), 'EXIT TIME': exit_ts, 'EXIT': round(exit_price, 2),
+            'OUTCOME': outcome, 'PNL %': round(pnl, 2), 'R': round(r, 2)}
+
+def _prepare_agent_frames(bulk, tickers):
+    frames = {}
+    for t in tickers:
+        try:
+            df = bulk[t].copy()
+            if df.empty or len(df) < 300: continue
+            df.dropna(inplace=True)
+            if not df.empty:
+                last_ts = df.index[-1]
+                now = pd.Timestamp.now(tz=last_ts.tzinfo)
+                if last_ts + pd.Timedelta(hours=1) > now:
+                    df = df.iloc[:-1]
+            if len(df) < 300: continue
+            df = calculate_expert_strategy(df)
+            df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+            df['EMA_20'] = ta.ema(df['Close'], length=20)
+            df['SMA_200'] = df['Close'].rolling(200).mean()
+            df['RSI_2'] = ta.rsi(df['Close'], length=2)
+            adx = ta.adx(df['High'], df['Low'], df['Close'])
+            if adx is not None: df = pd.concat([df, adx], axis=1)
+            macd = ta.macd(df['Close'])
+            if macd is not None: df = pd.concat([df, macd], axis=1)
+            mid = df['Close'].rolling(20).mean(); sd = df['Close'].rolling(20).std()
+            df['BB_LOW'] = mid - 2 * sd
+            df['DC_HI'] = df['High'].rolling(55).max().shift(1)
+            df['DC_LO'] = df['Low'].rolling(55).min().shift(1)
+            frames[t] = df
+        except Exception:
+            continue
+    return frames
+
+def _run_agents(frames):
+    trades = []
+    for agent in AGENT_DEFS:
+        sigs = []
+        for t, df in frames.items():
+            buy, sell = _agent_signals(agent['id'], df)
+            for ts in df.index[buy]: sigs.append((ts, t, 1))
+            for ts in df.index[sell]: sigs.append((ts, t, -1))
+        sigs.sort(key=lambda x: (x[0], x[1]))
+        per_day = {}
+        for ts, t, side in sigs:
+            day = ts.date()
+            if per_day.get(day, 0) >= 2: continue  # max 2 deals per day
+            rec = _simulate_deal(frames[t], ts, side, agent['target'], agent['stop'])
+            if rec is None: continue
+            per_day[day] = per_day.get(day, 0) + 1
+            rec['AGENT'] = agent['name']; rec['TICKER'] = t
+            trades.append(rec)
+    tdf = pd.DataFrame(trades)
+    if not tdf.empty:
+        tdf = tdf.sort_values('ENTRY TIME').reset_index(drop=True)
+    return tdf
+
+@st.cache_data(ttl=3600, show_spinner="🤖 Agents are trading the past year...")
+def build_agent_history(tickers):
+    return _run_agents(_prepare_agent_frames(download_bulk(tickers), tickers))
+
+def _fmt_deals(deals):
+    out = deals.copy()
+    out['ENTRY TIME'] = out['ENTRY TIME'].dt.strftime('%Y-%m-%d %H:%M')
+    out['EXIT TIME'] = out['EXIT TIME'].dt.strftime('%Y-%m-%d %H:%M').fillna('— open —')
+    cols = ['AGENT', 'TICKER', 'SIDE', 'ENTRY TIME', 'ENTRY', 'EXIT TIME', 'EXIT', 'OUTCOME', 'PNL %', 'R']
+    return out[[c for c in cols if c in out.columns]]
+
+def render_agents_page():
+    st.subheader("🤖 Trading Agents")
+    st.caption("Six virtual traders, each running one published, widely-backtested strategy across the whole "
+               "watchlist on hourly data. Each agent takes at most **2 deals per day** (first valid signals win) "
+               "with ATR-scaled exits and a time exit after ~5 trading days. Same rules for every stock — nothing "
+               "is tuned per ticker.")
+    tdf = build_agent_history(TICKERS)
+    if tdf.empty:
+        st.warning("No agent history could be built — market data unavailable.")
+        return
+
+    if 'followed' not in st.session_state: st.session_state['followed'] = set()
+
+    # --- DEALS FROM FOLLOWED AGENTS ---
+    if st.session_state['followed']:
+        st.markdown("#### ⭐ Deals from agents you follow")
+        f = tdf[tdf['AGENT'].isin(st.session_state['followed'])]
+        latest_day = tdf['ENTRY TIME'].max().normalize()
+        actionable = f[(f['OUTCOME'] == 'OPEN') | (f['ENTRY TIME'] >= latest_day)]
+        if actionable.empty:
+            st.caption("No open or new deals from your followed agents right now.")
+        else:
+            st.dataframe(style_table(_fmt_deals(actionable.sort_values('ENTRY TIME', ascending=False)), ('SIDE',)),
+                         use_container_width=True)
+        st.divider()
+
+    # --- PERIOD SELECTOR ---
+    colp, coln = st.columns([3, 1])
+    period = colp.selectbox("📅 History Period",
+        ["Daily (last trading day)", "Weekly", "Monthly", "Custom (months)", "Yearly (all data)"], index=2)
+    months = coln.number_input("Months", 1, 12, 3) if period == "Custom (months)" else None
+    end_ts = tdf['ENTRY TIME'].max()
+    if period.startswith("Daily"): cutoff = end_ts.normalize()
+    elif period == "Weekly": cutoff = end_ts - pd.Timedelta(days=7)
+    elif period == "Monthly": cutoff = end_ts - pd.Timedelta(days=30)
+    elif period == "Custom (months)": cutoff = end_ts - pd.Timedelta(days=30 * months)
+    else: cutoff = tdf['ENTRY TIME'].min()
+    view = tdf[tdf['ENTRY TIME'] >= cutoff]
+
+    # --- LEADERBOARD ---
+    st.markdown("#### 🏆 Agent Leaderboard")
+    rows = []
+    for agent in AGENT_DEFS:
+        a = view[view['AGENT'] == agent['name']]
+        closed = a[a['OUTCOME'] != 'OPEN']
+        wins = closed[closed['PNL %'] > 0]; losses = closed[closed['PNL %'] <= 0]
+        wr = len(wins) / len(closed) * 100 if len(closed) else 0
+        gross_loss = abs(losses['PNL %'].sum())
+        pf = wins['PNL %'].sum() / gross_loss if gross_loss > 0 else float('inf')
+        rows.append({'_pnl': closed['PNL %'].sum(),
+                     'AGENT': agent['name'], 'STRATEGY': agent['strategy'], 'DEALS': len(a),
+                     'WIN RATE': f"{wr:.0f}%",
+                     'TOTAL P&L': f"{closed['PNL %'].sum():+.1f}%",
+                     'AVG/DEAL': f"{closed['PNL %'].mean():+.2f}%" if len(closed) else "—",
+                     'PROFIT FACTOR': "∞" if pf == float('inf') else f"{pf:.2f}",
+                     'FOLLOWING': '⭐' if agent['name'] in st.session_state['followed'] else ''})
+    rows.sort(key=lambda r: r['_pnl'], reverse=True)
+    lb = pd.DataFrame(rows).drop(columns=['_pnl'])
+    st.dataframe(style_table(lb, ()), use_container_width=True)
+    st.caption("P&L assumes equal capital per deal, summed per-deal returns (not compounded). "
+               "Win rate and P&L count closed deals only; OPEN deals are excluded until they resolve.")
+
+    # --- EQUITY CURVES ---
+    figeq = go.Figure()
+    for agent in AGENT_DEFS:
+        a = view[(view['AGENT'] == agent['name']) & (view['OUTCOME'] != 'OPEN')].sort_values('EXIT TIME')
+        if a.empty: continue
+        figeq.add_trace(go.Scatter(x=a['EXIT TIME'], y=a['PNL %'].cumsum(),
+                                   mode='lines', name=agent['name']))
+    figeq.update_layout(height=400, template=plotly_template, paper_bgcolor=bg_color, plot_bgcolor=bg_color,
+                        title_text="Cumulative P&L per Agent (%)", title_font_color=text_color,
+                        font=dict(color=text_color), margin=dict(l=10, r=10, t=50, b=10),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(color=text_color)))
+    st.plotly_chart(figeq, use_container_width=True, key=f"eq_{plotly_template}")
+
+    st.divider()
+
+    # --- REVIEW A SINGLE AGENT ---
+    st.markdown("#### 🔍 Review an Agent")
+    sel = st.selectbox("Agent", [a['name'] for a in AGENT_DEFS], label_visibility="collapsed")
+    agent = next(a for a in AGENT_DEFS if a['name'] == sel)
+    st.markdown(f"**Strategy:** {agent['strategy']}")
+    st.markdown(f"**Why it works:** {agent['source']}")
+    st.markdown(f"**Exits:** target +{agent['target']}×ATR / stop −{agent['stop']}×ATR / time exit after ~5 trading days")
+
+    follow_now = st.toggle("⭐ Follow this agent (their open & new deals appear at the top of this page)",
+                           value=sel in st.session_state['followed'])
+    if follow_now: st.session_state['followed'].add(sel)
+    else: st.session_state['followed'].discard(sel)
+
+    a = view[view['AGENT'] == sel]
+    closed = a[a['OUTCOME'] != 'OPEN']
+    wins = closed[closed['PNL %'] > 0]
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Deals", len(a))
+    m2.metric("Win Rate", f"{(len(wins) / len(closed) * 100):.0f}%" if len(closed) else "—")
+    m3.metric("Total P&L", f"{closed['PNL %'].sum():+.1f}%")
+    m4.metric("Avg R", f"{closed['R'].mean():+.2f}" if len(closed) else "—")
+    m5.metric("Open Deals", len(a) - len(closed))
+
+    if a.empty:
+        st.caption("No deals for this agent in the selected period.")
+    else:
+        st.dataframe(style_table(_fmt_deals(a.sort_values('ENTRY TIME', ascending=False)), ('SIDE',)),
+                     use_container_width=True)
+
 # --- MAIN APP ---
 st.title("📈 US Stocks Analyzer")
 
 if 'chart_range' not in st.session_state: st.session_state['chart_range'] = '1M'
+
+# --- SECTION ROUTING ---
+if page == "🤖 Trading Agents":
+    render_agents_page()
+    st.stop()
 
 data, df_summ, failed_tickers = get_data(TICKERS, target_mult, stop_mult)
 
@@ -551,20 +830,6 @@ st.caption(f"Exits are volatility-scaled: target +{target_mult}×ATR, stop −{s
            "A win rate above breakeven means positive expectancy (Avg Edge > 0).")
 if failed_tickers:
     st.warning(f"⚠️ {len(failed_tickers)} ticker(s) failed to load and are excluded from the scanner: {', '.join(failed_tickers)}")
-
-def style_table(df, highlight_cols=('LIVE', 'DECISION')):
-    def highlight_live(val):
-        if 'LONG' in str(val) or 'BUY' in str(val): return 'background-color: #00FF00; color: black; font-weight: bold'
-        if 'SHORT' in str(val) or 'SELL' in str(val): return 'background-color: #FF4444; color: white; font-weight: bold'
-        return ''
-
-    # Use Pandas Styler to Force Colors
-    styler = df.style.map(highlight_live, subset=list(highlight_cols))
-    if is_dark:
-        styler.set_properties(**{'background-color': '#262730', 'color': 'white', 'border-color': '#444444'})
-    else:
-        styler.set_properties(**{'background-color': '#FFFFFF', 'color': 'black', 'border-color': '#E6E6EA'})
-    return styler
 
 st.dataframe(style_table(df_summ), use_container_width=True)
 
